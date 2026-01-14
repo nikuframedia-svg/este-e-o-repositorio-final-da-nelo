@@ -1,0 +1,235 @@
+"""
+ProdPlan ONE - MRP Service
+===========================
+
+Business logic for Material Requirements Planning.
+"""
+
+from datetime import datetime, date, timedelta
+from decimal import Decimal
+from typing import Any, Dict, List, Optional
+from uuid import UUID, uuid4
+
+from sqlalchemy import select, and_
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.plan.models.mrp import MaterialRequirement, PurchaseOrder, POStatus
+from src.plan.engines.mrp_adapter import MRPAdapter, GrossRequirement, InventoryPosition, RequirementSource
+from src.plan.engines.bom_adapter import BOMAdapter
+from src.shared.kafka_client import publish_event, Topics
+from src.shared.events import MRPCalculatedEvent, PurchaseOrderCreatedEvent
+
+
+class MRPService:
+    """
+    Service for Material Requirements Planning.
+    
+    Coordinates BOM explosion, inventory netting, and PO generation.
+    """
+    
+    def __init__(self, session: AsyncSession, tenant_id: UUID):
+        self.session = session
+        self.tenant_id = tenant_id
+        self._mrp_adapter = MRPAdapter()
+        self._bom_adapter = BOMAdapter()
+    
+    async def run_mrp(
+        self,
+        orders: List[Dict[str, Any]],
+        inventory: Dict[str, Dict[str, Any]] = None,
+        bom_data: Dict[str, Any] = None,
+        planning_horizon_weeks: int = 12,
+        include_safety_stock: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Run MRP for a set of orders.
+        
+        Args:
+            orders: List of orders with product_id, quantity, due_date
+            inventory: Current inventory positions by item
+            bom_data: BOM structure (items and components)
+            planning_horizon_weeks: Planning horizon
+            include_safety_stock: Include safety stock in requirements
+        
+        Returns:
+            MRP results with purchase and production suggestions
+        """
+        mrp_run_id = f"mrp-{uuid4().hex[:8]}"
+        inventory = inventory or {}
+        
+        # Configure MRP adapter
+        self._mrp_adapter.planning_horizon_days = planning_horizon_weeks * 7
+        
+        # Load BOM if provided
+        if bom_data:
+            self._bom_adapter.load_from_data(
+                items=bom_data.get("items", []),
+                components=bom_data.get("components", []),
+            )
+        
+        # Explode BOMs and collect all requirements
+        all_items = set()
+        
+        for order in orders:
+            product_id = str(order.get("product_id", ""))
+            quantity = Decimal(str(order.get("quantity", 0)))
+            due_date = order.get("due_date")
+            
+            if isinstance(due_date, str):
+                due_date = datetime.fromisoformat(due_date.replace("Z", "+00:00"))
+            elif isinstance(due_date, date):
+                due_date = datetime.combine(due_date, datetime.min.time())
+            
+            # Explode BOM
+            requirements = self._bom_adapter.explode(product_id, quantity)
+            
+            for req in requirements:
+                all_items.add(req.component_id)
+                
+                # Add gross requirement
+                self._mrp_adapter.add_requirement(GrossRequirement(
+                    item_id=req.component_id,
+                    period=due_date - timedelta(days=req.cumulative_lead_time),
+                    quantity=req.required_qty,
+                    source=RequirementSource.CUSTOMER_ORDER,
+                    reference_id=str(order.get("order_id", "")),
+                ))
+        
+        # Set inventory positions
+        for item_id, inv_data in inventory.items():
+            self._mrp_adapter.set_inventory(
+                item_id,
+                InventoryPosition(
+                    item_id=item_id,
+                    on_hand=Decimal(str(inv_data.get("on_hand", 0))),
+                    on_order=Decimal(str(inv_data.get("on_order", 0))),
+                    allocated=Decimal(str(inv_data.get("allocated", 0))),
+                    safety_stock=Decimal(str(inv_data.get("safety_stock", 0))) if include_safety_stock else Decimal("0"),
+                ),
+            )
+        
+        # Run MRP
+        result = self._mrp_adapter.run_mrp(list(all_items))
+        
+        # Save requirements to database
+        for suggestion in result.purchase_suggestions:
+            requirement = MaterialRequirement(
+                tenant_id=self.tenant_id,
+                mrp_run_id=mrp_run_id,
+                material_id=UUID(suggestion["item_id"]) if self._is_uuid(suggestion["item_id"]) else None,
+                gross_requirement=Decimal(str(suggestion.get("quantity", 0))),
+                net_requirement=Decimal(str(suggestion.get("quantity", 0))),
+                order_quantity=Decimal(str(suggestion.get("quantity", 0))),
+                lead_time_days=int(suggestion.get("lead_time_days", 0)),
+                order_date=date.fromisoformat(suggestion["start_date"][:10]) if suggestion.get("start_date") else date.today(),
+                due_date=date.fromisoformat(suggestion["due_date"][:10]) if suggestion.get("due_date") else date.today(),
+                is_purchased=True,
+            )
+            self.session.add(requirement)
+        
+        await self.session.flush()
+        
+        # Publish event
+        await publish_event(
+            Topics.MRP_CALCULATED,
+            MRPCalculatedEvent(
+                tenant_id=self.tenant_id,
+                payload={
+                    "mrp_run_id": mrp_run_id,
+                    "materials_analyzed": result.items_analyzed,
+                    "purchase_orders_created": result.purchase_orders_created,
+                    "total_po_value": float(result.total_po_value),
+                    "currency": result.currency,
+                },
+            ),
+        )
+        
+        return {
+            "mrp_run_id": mrp_run_id,
+            "status": "completed",
+            "items_analyzed": result.items_analyzed,
+            "purchase_orders": result.purchase_orders_created,
+            "production_orders": result.production_orders_created,
+            "total_po_value": float(result.total_po_value),
+            "currency": result.currency,
+            "purchase_suggestions": result.purchase_suggestions,
+            "production_suggestions": result.production_suggestions,
+            "warnings": result.warnings,
+        }
+    
+    async def create_purchase_orders(
+        self,
+        mrp_run_id: str,
+        suggestions: List[Dict[str, Any]],
+    ) -> List[PurchaseOrder]:
+        """Create purchase orders from MRP suggestions."""
+        created_pos = []
+        po_sequence = 1
+        
+        for suggestion in suggestions:
+            po_number = f"PO-{datetime.now().strftime('%Y%m%d')}-{po_sequence:04d}"
+            
+            po = PurchaseOrder(
+                tenant_id=self.tenant_id,
+                po_number=po_number,
+                supplier_id=UUID(suggestion["supplier_id"]) if suggestion.get("supplier_id") else None,
+                material_id=UUID(suggestion["item_id"]) if self._is_uuid(suggestion.get("item_id", "")) else None,
+                order_quantity=Decimal(str(suggestion.get("quantity", 0))),
+                unit_cost=Decimal(str(suggestion.get("unit_cost", 0))),
+                total_cost=Decimal(str(suggestion.get("line_total", 0))),
+                order_date=date.fromisoformat(suggestion["start_date"][:10]) if suggestion.get("start_date") else date.today(),
+                due_date=date.fromisoformat(suggestion["due_date"][:10]) if suggestion.get("due_date") else date.today(),
+                status=POStatus.DRAFT,
+                mrp_run_id=mrp_run_id,
+            )
+            
+            self.session.add(po)
+            created_pos.append(po)
+            
+            # Publish event
+            await publish_event(
+                Topics.PURCHASE_ORDER_CREATED,
+                PurchaseOrderCreatedEvent(
+                    tenant_id=self.tenant_id,
+                    payload={
+                        "po_id": str(po.id),
+                        "po_number": po_number,
+                        "material_id": suggestion.get("item_id"),
+                        "quantity": suggestion.get("quantity", 0),
+                        "total_value": suggestion.get("line_total", 0),
+                        "due_date": suggestion.get("due_date", ""),
+                    },
+                ),
+            )
+            
+            po_sequence += 1
+        
+        await self.session.flush()
+        return created_pos
+    
+    async def get_requirements(
+        self,
+        mrp_run_id: str = None,
+        material_id: UUID = None,
+    ) -> List[MaterialRequirement]:
+        """Get material requirements."""
+        query = select(MaterialRequirement).where(
+            MaterialRequirement.tenant_id == self.tenant_id
+        )
+        
+        if mrp_run_id:
+            query = query.where(MaterialRequirement.mrp_run_id == mrp_run_id)
+        if material_id:
+            query = query.where(MaterialRequirement.material_id == material_id)
+        
+        result = await self.session.execute(query)
+        return list(result.scalars().all())
+    
+    def _is_uuid(self, value: str) -> bool:
+        """Check if string is valid UUID."""
+        try:
+            UUID(value)
+            return True
+        except (ValueError, TypeError):
+            return False
+

@@ -1,0 +1,114 @@
+"""
+ProdPlan ONE - Products API
+============================
+
+REST endpoints for product management.
+"""
+
+from typing import List
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Header, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.shared.database import get_session
+from src.core.models.product import ProductType, ProductStatus
+from src.core.services.master_data_service import MasterDataService
+from .schemas import ProductCreate, ProductUpdate, ProductResponse
+
+router = APIRouter(prefix="/products", tags=["Products"])
+
+
+def get_tenant_id(x_tenant_id: UUID = Header(...)) -> UUID:
+    """Extract tenant ID from header."""
+    return x_tenant_id
+
+
+@router.post("", response_model=ProductResponse, status_code=status.HTTP_201_CREATED)
+async def create_product(
+    data: ProductCreate,
+    tenant_id: UUID = Depends(get_tenant_id),
+    session: AsyncSession = Depends(get_session),
+):
+    """Create a new product."""
+    service = MasterDataService(session, tenant_id)
+    
+    # Check if code already exists
+    existing = await service.get_product_by_code(data.product_code)
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Product code '{data.product_code}' already exists",
+        )
+    
+    product = await service.create_product(
+        product_code=data.product_code,
+        product_name=data.product_name,
+        product_type=data.product_type,
+        category=data.category,
+        lead_time_days=data.lead_time_days,
+        standard_cost=data.standard_cost,
+    )
+    
+    return product
+
+
+@router.get("", response_model=List[ProductResponse])
+async def list_products(
+    product_type: ProductType = None,
+    status: ProductStatus = None,
+    category: str = None,
+    limit: int = 100,
+    offset: int = 0,
+    tenant_id: UUID = Depends(get_tenant_id),
+    session: AsyncSession = Depends(get_session),
+):
+    """List products with optional filtering."""
+    service = MasterDataService(session, tenant_id)
+    products = await service.list_products(
+        product_type=product_type,
+        status=status,
+        category=category,
+        limit=limit,
+        offset=offset,
+    )
+    return products
+
+
+@router.get("/{product_id}", response_model=ProductResponse)
+async def get_product(
+    product_id: UUID,
+    tenant_id: UUID = Depends(get_tenant_id),
+    session: AsyncSession = Depends(get_session),
+):
+    """Get product by ID."""
+    service = MasterDataService(session, tenant_id)
+    product = await service.get_product(product_id)
+    
+    if not product:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Product {product_id} not found",
+        )
+    
+    return product
+
+
+@router.get("/code/{product_code}", response_model=ProductResponse)
+async def get_product_by_code(
+    product_code: str,
+    tenant_id: UUID = Depends(get_tenant_id),
+    session: AsyncSession = Depends(get_session),
+):
+    """Get product by code."""
+    service = MasterDataService(session, tenant_id)
+    product = await service.get_product_by_code(product_code)
+    
+    if not product:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Product '{product_code}' not found",
+        )
+    
+    return product
+
