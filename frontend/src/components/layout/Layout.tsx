@@ -1,4 +1,5 @@
 import { Outlet } from 'react-router-dom';
+import { CopilotFab } from '../copilot/CopilotFab';
 
 export function Layout() {
   return (
@@ -6,6 +7,7 @@ export function Layout() {
       <main>
         <Outlet />
       </main>
+      <CopilotFab />
     </div>
   );
 }

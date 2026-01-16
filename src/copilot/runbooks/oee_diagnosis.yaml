@@ -1,0 +1,17 @@
+id: oee_diagnosis
+name: "Diagnóstico OEE & FPY"
+description: "Analisa perdas OEE e drivers de FPY"
+inputs:
+  date_range:
+    type: date_range
+    default: 24h
+queries:
+  - name: rework_rate
+    sql: "SELECT AVG(rework_rate) as avg_rework FROM orders WHERE created_at >= :start_date"
+  - name: top_losses
+    sql: "SELECT phase_name, COUNT(*) as error_count FROM errors WHERE severity >= 2 AND created_at >= :start_date GROUP BY phase_name ORDER BY error_count DESC LIMIT 5"
+output_schema:
+  type: RUNBOOK_RESULT
+  facts_required: true
+
+

@@ -48,3 +48,5 @@ black==23.12.1
 isort==5.13.2
 mypy==1.8.0
 
+# COPILOT
+tiktoken==0.5.2  # Para token counting (opcional)

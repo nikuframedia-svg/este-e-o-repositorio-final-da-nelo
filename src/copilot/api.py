@@ -1,0 +1,877 @@
+"""
+ProdPlan ONE - COPILOT API
+===========================
+
+FastAPI router para endpoints do COPILOT.
+"""
+
+import logging
+from datetime import date, datetime
+from typing import Optional
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, status, Header, Body
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Dict, Any, List
+
+from src.copilot.schemas import (
+    CopilotAskRequest,
+    CopilotResponse,
+    CopilotActionRequest,
+    DailyFeedbackResponse,
+)
+from src.copilot.service import CopilotService
+from src.copilot.models import CopilotSuggestion, CopilotDecisionPR, CopilotConversation, CopilotMessage
+from src.copilot.recommendations import generate_recommendations
+from sqlalchemy import select, and_
+from src.copilot.rate_limiter import get_rate_limiter
+from src.copilot.ollama_client import get_ollama_client
+from src.copilot.rag import ingest_document
+from src.copilot.jobs.daily_feedback import generate_daily_feedback
+from src.shared.database import get_session
+from src.shared.auth.jwt_handler import get_current_user, UserContext
+from src.shared.auth.rbac import PermissionDependency, Permission
+from src.shared.config import settings
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/copilot", tags=["COPILOT"])
+
+
+def get_tenant_id(x_tenant_id: UUID = Header(...)) -> UUID:
+    """Extract tenant ID from header."""
+    return x_tenant_id
+
+
+@router.post("/ask", response_model=CopilotResponse, status_code=status.HTTP_200_OK)
+async def ask_copilot(
+    request: CopilotAskRequest,
+    user: UserContext = Depends(get_current_user),
+    tenant_id: UUID = Depends(get_tenant_id),
+    session: AsyncSession = Depends(get_session),
+    conversation_id: Optional[UUID] = None,
+):
+    """
+    Fazer pergunta ao COPILOT.
+    
+    Processo:
+    1. Rate limiting
+    2. Guardrails (injection filter)
+    3. Build context
+    4. Retrieve RAG
+    5. Call Ollama (ou fast path)
+    6. Validate response
+    7. Store audit
+    8. Store message in conversation (se conversation_id fornecido)
+    9. Return response
+    """
+    # Rate limiting
+    rate_limiter = get_rate_limiter()
+    await rate_limiter.enforce_rate_limit(tenant_id, user.user_id)
+    
+    # Service
+    service = CopilotService(session, tenant_id, user.user_id, user.role)
+    
+    # Processar com tratamento de erros
+    try:
+        response, audit_data = await service.process_ask(request)
+        return response
+    except Exception as e:
+        # Capturar qualquer erro não tratado e normalizar
+        from uuid import uuid4
+        import logging
+        logger = logging.getLogger(__name__)
+        correlation_id = uuid4()
+        
+        logger.error(
+            f"Erro inesperado ao processar pergunta do COPILOT. "
+            f"Correlation: {correlation_id}. Erro: {str(e)}",
+            exc_info=True
+        )
+        
+        # Retornar resposta de erro normalizada
+        from src.copilot.schemas import CopilotResponse
+        return CopilotResponse(
+            suggestion_id=uuid4(),
+            correlation_id=correlation_id,
+            type="ERROR",
+            intent="generic",
+            summary="Ocorreu um erro ao processar a tua pergunta. Tenta novamente.",
+            facts=[],
+            actions=[],
+            warnings=[
+                {
+                    "code": "MODEL_OFFLINE",
+                    "message": "O serviço COPILOT está temporariamente indisponível. Verifica os logs do sistema.",
+                }
+            ],
+            meta={
+                "validation_passed": False,
+            },
+        )
+
+
+@router.post("/action", status_code=status.HTTP_200_OK)
+async def execute_action(
+    request: CopilotActionRequest,
+    user: UserContext = Depends(get_current_user),
+    tenant_id: UUID = Depends(get_tenant_id),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Executar ação permitida.
+    
+    Ações suportadas:
+    - CREATE_DECISION_PR: Criar PR de melhoria
+    - DRY_RUN: Simular sem persistir
+    - OPEN_ENTITY: Hint para frontend navegar
+    - RUN_RUNBOOK: Executar runbook
+    """
+    # Verificar que suggestion existe
+    suggestion = await session.get(CopilotSuggestion, request.suggestion_id)
+    if not suggestion or suggestion.tenant_id != tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Suggestion não encontrada",
+        )
+    
+    # Executar ação
+    if request.action_type == "CREATE_DECISION_PR":
+        # Criar PR
+        pr = CopilotDecisionPR(
+            tenant_id=tenant_id,
+            suggestion_id=request.suggestion_id,
+            title=request.payload.get("title", "Decision PR"),
+            description=request.payload.get("description", ""),
+            payload=request.payload,
+            status="PENDING",
+        )
+        session.add(pr)
+        await session.flush()
+        
+        return {
+            "action_id": str(pr.id),
+            "status": "created",
+            "message": "Decision PR criado com sucesso",
+        }
+    
+    elif request.action_type == "DRY_RUN":
+        # Dry run - retornar hint (não executar realmente)
+        return {
+            "action_type": "DRY_RUN",
+            "status": "simulated",
+            "message": "Dry run executado (sem persistência)",
+            "payload": request.payload,
+        }
+    
+    elif request.action_type == "OPEN_ENTITY":
+        # Hint para frontend
+        return {
+            "action_type": "OPEN_ENTITY",
+            "status": "hint",
+            "navigation": request.payload,
+        }
+    
+    elif request.action_type == "RUN_RUNBOOK":
+        # Executar runbook (TODO: implementar executor)
+        return {
+            "action_type": "RUN_RUNBOOK",
+            "status": "not_implemented",
+            "message": "Runbook executor ainda não implementado",
+        }
+    
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Ação '{request.action_type}' não suportada",
+        )
+
+
+@router.get("/suggestions/{suggestion_id}", response_model=CopilotResponse)
+async def get_suggestion(
+    suggestion_id: UUID,
+    user: UserContext = Depends(get_current_user),
+    tenant_id: UUID = Depends(get_tenant_id),
+    session: AsyncSession = Depends(get_session),
+):
+    """Obter registo imutável de sugestão (audit)."""
+    suggestion = await session.get(CopilotSuggestion, suggestion_id)
+    
+    if not suggestion or suggestion.tenant_id != tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Suggestion não encontrada",
+        )
+    
+    return suggestion.response_json
+
+
+@router.get("/daily-feedback", response_model=DailyFeedbackResponse)
+async def get_daily_feedback(
+    date_param: Optional[str] = None,
+    user: UserContext = Depends(get_current_user),
+    tenant_id: UUID = Depends(get_tenant_id),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Obter feedback diário do COPILOT.
+    
+    Se não existir ou expirado, gera novo.
+    """
+    target_date = date_param or date.today().isoformat()
+    
+    # Gerar feedback (com cache interno)
+    feedback = await generate_daily_feedback(session, tenant_id, target_date)
+    
+    return feedback
+
+
+@router.get("/daily-feedback-dev", response_model=DailyFeedbackResponse)
+async def get_daily_feedback_dev(
+    date_param: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Endpoint de desenvolvimento - SEM autenticação.
+    """
+    from uuid import UUID
+    
+    dev_tenant_id = UUID("00000000-0000-0000-0000-000000000001")
+    target_date = date_param or date.today().isoformat()
+    
+    # Gerar feedback (com cache interno)
+    feedback = await generate_daily_feedback(session, dev_tenant_id, target_date)
+    
+    return feedback
+
+
+@router.post("/rag/ingest", status_code=status.HTTP_201_CREATED)
+async def ingest_rag_document(
+    source_type: str,
+    source_id: str,
+    text: str,
+    metadata: Optional[dict] = None,
+    user: UserContext = Depends(
+        PermissionDependency([Permission.CONFIG_WRITE])
+    ),
+    tenant_id: UUID = Depends(get_tenant_id),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Ingestão de documento para RAG (admin only).
+    
+    Aceita markdown/PDF/texto.
+    """
+    chunks_created = await ingest_document(
+        session,
+        tenant_id,
+        source_type,
+        source_id,
+        text,
+        metadata,
+    )
+    
+    return {
+        "status": "success",
+        "chunks_created": chunks_created,
+        "source_type": source_type,
+        "source_id": source_id,
+    }
+
+
+@router.post("/health/reset-circuit")
+async def reset_circuit_breaker():
+    """
+    Reset manual do circuit breaker do Ollama (útil para debugging).
+    """
+    try:
+        ollama_client = get_ollama_client()
+        ollama_client.reset_circuit_breaker()
+        return {
+            "status": "success",
+            "message": "Circuit breaker resetado",
+        }
+    except Exception as e:
+        logger.error(f"Erro ao resetar circuit breaker: {e}")
+        return {
+            "status": "error",
+            "message": str(e),
+        }
+
+
+@router.get("/health")
+async def copilot_health():
+    """
+    Health check do COPILOT.
+    
+    Verifica: Ollama, DB, embeddings, rate limit.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    try:
+        ollama_client = get_ollama_client()
+        
+        # Se circuit breaker está aberto, tentar resetar se já passou tempo suficiente
+        if hasattr(ollama_client, '_circuit_open_until') and ollama_client._circuit_open_until:
+            remaining = (ollama_client._circuit_open_until - datetime.utcnow()).total_seconds()
+            if remaining < 0:
+                # Circuit já deveria estar fechado, resetar manualmente
+                ollama_client.reset_circuit_breaker()
+                logger.info("Circuit breaker resetado no health check")
+        
+        ollama_online = await ollama_client.health_check()
+        
+        # Log detalhado para debugging
+        if not ollama_online:
+            circuit_info = "fechado"
+            if hasattr(ollama_client, '_circuit_open_until') and ollama_client._circuit_open_until:
+                remaining = (ollama_client._circuit_open_until - datetime.utcnow()).total_seconds()
+                circuit_info = f"aberto (fecha em {remaining:.1f}s)"
+            
+            logger.warning(
+                f"Ollama está offline. Base URL: {ollama_client.base_url}. "
+                f"Circuit breaker: {circuit_info}. "
+                f"Failure count: {getattr(ollama_client, '_failure_count', 0)}"
+            )
+        
+        return {
+            "status": "healthy" if ollama_online else "degraded",
+            "ollama": "online" if ollama_online else "offline",
+            "embeddings_model": getattr(settings, "copilot_embeddings_model", "all-minilm"),
+            "ollama_base_url": ollama_client.base_url,
+            "ollama_model": settings.ollama_model,
+            "rate_limit": {
+                "per_hour": settings.copilot_rate_limit_per_hour,
+                "per_day": settings.copilot_rate_limit_per_day,
+            },
+        }
+    except Exception as e:
+        logger.error(f"Erro no health check do COPILOT: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "ollama": "offline",
+            "error": str(e),
+            "embeddings_model": getattr(settings, "copilot_embeddings_model", "all-minilm"),
+        }
+
+
+@router.post("/ask-dev", response_model=CopilotResponse, status_code=status.HTTP_200_OK)
+async def ask_copilot_dev(
+    request: CopilotAskRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Endpoint de desenvolvimento - SEM autenticação.
+    
+    Usa tenant_id e user_id padrão para testes.
+    """
+    from uuid import UUID
+    
+    # Valores padrão para desenvolvimento
+    dev_tenant_id = UUID("00000000-0000-0000-0000-000000000001")
+    dev_user_id = UUID("00000000-0000-0000-0000-000000000001")
+    dev_role = "ADMIN"
+    
+    # Rate limiting (com valores dev)
+    rate_limiter = get_rate_limiter()
+    await rate_limiter.enforce_rate_limit(dev_tenant_id, dev_user_id)
+    
+    # Service
+    service = CopilotService(session, dev_tenant_id, dev_user_id, dev_role)
+    
+    # Processar
+    response, audit_data = await service.process_ask(request)
+    
+    return response
+
+
+
+@router.get("/recommendations", response_model=List[Dict[str, Any]], tags=["COPILOT"])
+async def get_recommendations(
+    tenant_id: UUID = Depends(get_tenant_id),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Obter recomendações geradas automaticamente baseadas em análise de dados.
+    """
+    recommendations = await generate_recommendations(session, tenant_id)
+    return recommendations
+
+
+@router.get("/recommendations-dev", response_model=List[Dict[str, Any]], tags=["COPILOT"])
+async def get_recommendations_dev(
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Endpoint de desenvolvimento - SEM autenticação.
+    """
+    dev_tenant_id = UUID("00000000-0000-0000-0000-000000000001")
+    recommendations = await generate_recommendations(session, dev_tenant_id)
+    return recommendations
+
+
+@router.post("/recommendations/explain", response_model=CopilotResponse, tags=["COPILOT"])
+async def explain_recommendations(
+    request: Dict[str, Any] = Body(...),
+    user: UserContext = Depends(get_current_user),
+    tenant_id: UUID = Depends(get_tenant_id),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Pedir ao LLM para explicar recomendações.
+    
+    Request body:
+    {
+        "recommendations": [...],  # Lista de recomendações
+        "user_query": "Explica-me estas recomendações"  # Opcional
+    }
+    """
+    recommendations = request.get("recommendations", [])
+    user_query = request.get("user_query", "Explica-me estas recomendações e como implementá-las.")
+    
+    # Construir prompt com recomendações (incluindo origins, confidence, limitations)
+    recommendations_text = "\n\n".join([
+        f"**{i+1}. {rec.get('title', 'Recomendação')}** ({rec.get('category', 'GENERAL')})\n"
+        f"{rec.get('description', '')}\n"
+        f"Impacto: {rec.get('impact_metric', 'N/A')} = {rec.get('impact_value', 0):.1f}\n"
+        f"Fases afetadas: {', '.join(rec.get('affected_phases', []))}\n"
+        f"Ações sugeridas: {', '.join(rec.get('suggested_actions', []))}\n"
+        f"**ORIGENS**: {', '.join(rec.get('origins', []))}\n"
+        f"**CONFIANÇA**: {rec.get('confidence', 'N/A')}\n"
+        f"**LIMITAÇÕES**: {', '.join(rec.get('limitations', [])) if rec.get('limitations') else 'Nenhuma especificada'}"
+        for i, rec in enumerate(recommendations)
+    ])
+    
+    # Criar request para o COPILOT (passar origins para validação)
+    copilot_request = CopilotAskRequest(
+        user_query=f"{user_query}\n\nRecomendações:\n{recommendations_text}",
+        entity_type="recommendations",
+        include_citations=True,
+    )
+    
+    # Adicionar metadata sobre origins para validação
+    copilot_request._recommendation_origins = [
+        rec.get('origins', []) for rec in recommendations
+    ]
+    
+    # Processar com COPILOT
+    service = CopilotService(session, tenant_id, user.user_id, user.role)
+    response, _ = await service.process_ask(copilot_request)
+    
+    return response
+
+
+@router.post("/recommendations/explain-dev", response_model=CopilotResponse, tags=["COPILOT"])
+async def explain_recommendations_dev(
+    request: Dict[str, Any] = Body(...),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Endpoint de desenvolvimento - SEM autenticação.
+    """
+    dev_tenant_id = UUID("00000000-0000-0000-0000-000000000001")
+    dev_user_id = UUID("00000000-0000-0000-0000-000000000001")
+    dev_role = "ADMIN"
+    
+    recommendations = request.get("recommendations", [])
+    user_query = request.get("user_query", "Explica-me estas recomendações e como implementá-las.")
+    
+    recommendations_text = "\n\n".join([
+        f"**{i+1}. {rec.get('title', 'Recomendação')}** ({rec.get('category', 'GENERAL')})\n"
+        f"{rec.get('description', '')}\n"
+        f"Impacto: {rec.get('impact_metric', 'N/A')} = {rec.get('impact_value', 0):.1f}\n"
+        f"Fases afetadas: {', '.join(rec.get('affected_phases', []))}\n"
+        f"Ações sugeridas: {', '.join(rec.get('suggested_actions', []))}\n"
+        f"**ORIGENS**: {', '.join(rec.get('origins', []))}\n"
+        f"**CONFIANÇA**: {rec.get('confidence', 'N/A')}\n"
+        f"**LIMITAÇÕES**: {', '.join(rec.get('limitations', [])) if rec.get('limitations') else 'Nenhuma especificada'}"
+        for i, rec in enumerate(recommendations)
+    ])
+    
+    copilot_request = CopilotAskRequest(
+        user_query=f"{user_query}\n\nRecomendações:\n{recommendations_text}",
+        entity_type="recommendations",
+        include_citations=True,
+    )
+    
+    # Adicionar metadata sobre origins para validação
+    copilot_request._recommendation_origins = [
+        rec.get('origins', []) for rec in recommendations
+    ]
+    
+    service = CopilotService(session, dev_tenant_id, dev_user_id, dev_role)
+    response, _ = await service.process_ask(copilot_request)
+    
+    return response
+
+
+@router.get("/insights", response_model=Dict[str, Any], tags=["COPILOT"])
+async def get_insights(
+    date: Optional[str] = None,
+    tenant_id: UUID = Depends(get_tenant_id),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Obter insights agregados: daily feedback + recommendations.
+    
+    Retorna timeline única com:
+    - "now": alertas/insights diários (daily feedback)
+    - "next": recomendações de melhoria (recommendations)
+    """
+    from datetime import date as date_type, datetime
+    
+    # Data alvo (hoje se não especificada)
+    if date:
+        target_date = date
+    else:
+        target_date = datetime.utcnow().date().isoformat()
+    
+    # 1. Obter daily feedback
+    daily_feedback = await generate_daily_feedback(session, tenant_id, target_date)
+    now_items = []
+    
+    # Converter bullets para formato de insights
+    for bullet in daily_feedback.bullets:
+        now_items.append({
+            "id": f"alert-{len(now_items) + 1}",
+            "severity": bullet.severity,
+            "title": bullet.title,
+            "text": bullet.text,
+            "citations": bullet.citations,
+            "suggested_runbooks": bullet.suggested_runbooks,
+            "suggested_actions": bullet.suggested_actions or [],
+        })
+    
+    # Ordenar "now" por severidade: CRITICAL > WARN > INFO
+    severity_order = {"CRITICAL": 0, "WARN": 1, "INFO": 2}
+    now_items.sort(key=lambda x: (severity_order.get(x["severity"], 999), x.get("title", "")))
+    
+    # Deduplicar "now" (por title+text)
+    seen_now = set()
+    deduped_now = []
+    for item in now_items:
+        key = f"{item['title']}|{item['text']}"
+        if key not in seen_now:
+            seen_now.add(key)
+            deduped_now.append(item)
+    now_items = deduped_now
+    
+    # 2. Obter recommendations
+    recommendations = await generate_recommendations(session, tenant_id)
+    next_items = []
+    
+    # Converter recommendations para formato de insights
+    for rec in recommendations:
+        next_items.append({
+            "id": f"rec-{len(next_items) + 1}",
+            "priority": rec.get("priority", 999),
+            "category": rec.get("category", "GENERAL"),
+            "title": rec.get("title", "Recomendação"),
+            "description": rec.get("description", ""),
+            "impact_metric": rec.get("impact_metric", ""),
+            "impact_value": rec.get("impact_value", 0.0),
+            "affected_phases": rec.get("affected_phases", []),
+            "suggested_actions": rec.get("suggested_actions", []),
+            "origins": rec.get("origins", ["BEST_PRACTICE"]),
+            "confidence": rec.get("confidence", "MEDIUM"),
+            "limitations": rec.get("limitations", []),
+            "next_steps": rec.get("next_steps", []),
+            "data_evidence": rec.get("data_evidence", {}),
+        })
+    
+    # Ordenar "next" por prioridade: 1 > 2 > 3
+    next_items.sort(key=lambda x: (x.get("priority", 999), -x.get("impact_value", 0)))
+    
+    # Deduplicar "next" (por title+description)
+    seen_next = set()
+    deduped_next = []
+    for item in next_items:
+        key = f"{item['title']}|{item['description']}"
+        if key not in seen_next:
+            seen_next.add(key)
+            deduped_next.append(item)
+    next_items = deduped_next
+    
+    return {
+        "date": target_date,
+        "now": now_items,
+        "next": next_items,
+        "meta": {
+            "generated_at": datetime.utcnow().isoformat(),
+            "sources": ["daily_feedback_cache", "recommendations_runtime"],
+        },
+    }
+
+
+@router.get("/insights-dev", response_model=Dict[str, Any], tags=["COPILOT"])
+async def get_insights_dev(
+    date: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Endpoint de desenvolvimento - SEM autenticação.
+    """
+    dev_tenant_id = UUID("00000000-0000-0000-0000-000000000001")
+    
+    from datetime import date as date_type, datetime
+    
+    if date:
+        target_date = date
+    else:
+        target_date = datetime.utcnow().date().isoformat()
+    
+    # Mesma lógica do endpoint normal
+    daily_feedback = await generate_daily_feedback(session, dev_tenant_id, target_date)
+    now_items = []
+    
+    for bullet in daily_feedback.bullets:
+        now_items.append({
+            "id": f"alert-{len(now_items) + 1}",
+            "severity": bullet.severity,
+            "title": bullet.title,
+            "text": bullet.text,
+            "citations": bullet.citations,
+            "suggested_runbooks": bullet.suggested_runbooks,
+            "suggested_actions": bullet.suggested_actions or [],
+        })
+    
+    severity_order = {"CRITICAL": 0, "WARN": 1, "INFO": 2}
+    now_items.sort(key=lambda x: (severity_order.get(x["severity"], 999), x.get("title", "")))
+    
+    seen_now = set()
+    deduped_now = []
+    for item in now_items:
+        key = f"{item['title']}|{item['text']}"
+        if key not in seen_now:
+            seen_now.add(key)
+            deduped_now.append(item)
+    now_items = deduped_now
+    
+    recommendations = await generate_recommendations(session, dev_tenant_id)
+    next_items = []
+    
+    for rec in recommendations:
+        next_items.append({
+            "id": f"rec-{len(next_items) + 1}",
+            "priority": rec.get("priority", 999),
+            "category": rec.get("category", "GENERAL"),
+            "title": rec.get("title", "Recomendação"),
+            "description": rec.get("description", ""),
+            "impact_metric": rec.get("impact_metric", ""),
+            "impact_value": rec.get("impact_value", 0.0),
+            "affected_phases": rec.get("affected_phases", []),
+            "suggested_actions": rec.get("suggested_actions", []),
+            "origins": rec.get("origins", ["BEST_PRACTICE"]),
+            "confidence": rec.get("confidence", "MEDIUM"),
+            "limitations": rec.get("limitations", []),
+            "next_steps": rec.get("next_steps", []),
+            "data_evidence": rec.get("data_evidence", {}),
+        })
+    
+    next_items.sort(key=lambda x: (x.get("priority", 999), -x.get("impact_value", 0)))
+    
+    seen_next = set()
+    deduped_next = []
+    for item in next_items:
+        key = f"{item['title']}|{item['description']}"
+        if key not in seen_next:
+            seen_next.add(key)
+            deduped_next.append(item)
+    next_items = deduped_next
+    
+    return {
+        "date": target_date,
+        "now": now_items,
+        "next": next_items,
+        "meta": {
+            "generated_at": datetime.utcnow().isoformat(),
+            "sources": ["daily_feedback_cache", "recommendations_runtime"],
+        },
+    }
+
+
+# ============================================================================
+# CONVERSATIONS API
+# ============================================================================
+
+@router.post("/conversations", status_code=status.HTTP_201_CREATED)
+async def create_conversation(
+    user: UserContext = Depends(get_current_user),
+    tenant_id: UUID = Depends(get_tenant_id),
+    session: AsyncSession = Depends(get_session),
+    title: Optional[str] = Body(None),
+):
+    """Criar nova conversa."""
+    conversation = CopilotConversation(
+        tenant_id=tenant_id,
+        actor_id=user.user_id,
+        title=title or "Nova conversa",
+    )
+    session.add(conversation)
+    await session.flush()
+    await session.refresh(conversation)
+    
+    return {
+        "id": str(conversation.id),
+        "title": conversation.title,
+        "created_at": conversation.created_at.isoformat(),
+    }
+
+
+@router.get("/conversations", status_code=status.HTTP_200_OK)
+async def list_conversations(
+    user: UserContext = Depends(get_current_user),
+    tenant_id: UUID = Depends(get_tenant_id),
+    session: AsyncSession = Depends(get_session),
+    limit: int = 20,
+    offset: int = 0,
+    archived: bool = False,
+):
+    """Listar conversas do utilizador."""
+    query = select(CopilotConversation).where(
+        and_(
+            CopilotConversation.tenant_id == tenant_id,
+            CopilotConversation.actor_id == user.user_id,
+            CopilotConversation.is_archived == archived,
+        )
+    ).order_by(CopilotConversation.last_message_at.desc().nulls_last(), CopilotConversation.created_at.desc())
+    
+    result = await session.execute(query.offset(offset).limit(limit))
+    conversations = result.scalars().all()
+    
+    return [
+        {
+            "id": str(c.id),
+            "title": c.title,
+            "created_at": c.created_at.isoformat(),
+            "last_message_at": c.last_message_at.isoformat() if c.last_message_at else None,
+            "is_archived": c.is_archived,
+        }
+        for c in conversations
+    ]
+
+
+@router.get("/conversations/{conversation_id}/messages", status_code=status.HTTP_200_OK)
+async def get_conversation_messages(
+    conversation_id: UUID,
+    user: UserContext = Depends(get_current_user),
+    tenant_id: UUID = Depends(get_tenant_id),
+    session: AsyncSession = Depends(get_session),
+    limit: int = 100,
+    offset: int = 0,
+):
+    """Obter mensagens de uma conversa."""
+    # Verificar que a conversa pertence ao utilizador
+    conversation = await session.get(CopilotConversation, conversation_id)
+    if not conversation or conversation.tenant_id != tenant_id or conversation.actor_id != user.user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversa não encontrada")
+    
+    query = select(CopilotMessage).where(
+        and_(
+            CopilotMessage.tenant_id == tenant_id,
+            CopilotMessage.conversation_id == conversation_id,
+        )
+    ).order_by(CopilotMessage.created_at.asc())
+    
+    result = await session.execute(query.offset(offset).limit(limit))
+    messages = result.scalars().all()
+    
+    return [
+        {
+            "id": str(m.id),
+            "role": m.actor_role,
+            "content_text": m.content_text,
+            "content_structured": m.content_structured,
+            "created_at": m.created_at.isoformat(),
+        }
+        for m in messages
+    ]
+
+
+@router.post("/conversations/{conversation_id}/messages", status_code=status.HTTP_201_CREATED)
+async def send_message(
+    conversation_id: UUID,
+    request: CopilotAskRequest,
+    user: UserContext = Depends(get_current_user),
+    tenant_id: UUID = Depends(get_tenant_id),
+    session: AsyncSession = Depends(get_session),
+):
+    """Enviar mensagem numa conversa e obter resposta do COPILOT."""
+    # Verificar que a conversa pertence ao utilizador
+    conversation = await session.get(CopilotConversation, conversation_id)
+    if not conversation or conversation.tenant_id != tenant_id or conversation.actor_id != user.user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversa não encontrada")
+    
+    # Guardar mensagem do utilizador
+    user_message = CopilotMessage(
+        tenant_id=tenant_id,
+        conversation_id=conversation_id,
+        actor_role="user",
+        content_text=request.user_query,
+        content_structured=None,
+    )
+    session.add(user_message)
+    await session.flush()
+    
+    # Processar pergunta com COPILOT
+    service = CopilotService(session, tenant_id, user.user_id, user.role)
+    response, audit_data = await service.process_ask(request)
+    
+    # Guardar resposta do COPILOT
+    copilot_message = CopilotMessage(
+        tenant_id=tenant_id,
+        conversation_id=conversation_id,
+        actor_role="copilot",
+        content_text=response.summary,
+        content_structured=response.model_dump(),
+        correlation_id=response.correlation_id,
+        latency_ms=audit_data.get("latency_ms"),
+        model=audit_data.get("model") or response.meta.get("model"),
+        validation_passed=response.meta.get("validation_passed"),
+    )
+    session.add(copilot_message)
+    
+    # Atualizar last_message_at da conversa
+    conversation.last_message_at = datetime.utcnow()
+    
+    await session.commit()
+    
+    return response
+
+
+@router.patch("/conversations/{conversation_id}/rename", status_code=status.HTTP_200_OK)
+async def rename_conversation(
+    conversation_id: UUID,
+    title: str = Body(..., embed=True),
+    user: UserContext = Depends(get_current_user),
+    tenant_id: UUID = Depends(get_tenant_id),
+    session: AsyncSession = Depends(get_session),
+):
+    """Renomear conversa."""
+    conversation = await session.get(CopilotConversation, conversation_id)
+    if not conversation or conversation.tenant_id != tenant_id or conversation.actor_id != user.user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversa não encontrada")
+    
+    conversation.title = title
+    await session.commit()
+    
+    return {"id": str(conversation.id), "title": conversation.title}
+
+
+@router.post("/conversations/{conversation_id}/archive", status_code=status.HTTP_200_OK)
+async def archive_conversation(
+    conversation_id: UUID,
+    user: UserContext = Depends(get_current_user),
+    tenant_id: UUID = Depends(get_tenant_id),
+    session: AsyncSession = Depends(get_session),
+):
+    """Arquivar/desarquivar conversa."""
+    conversation = await session.get(CopilotConversation, conversation_id)
+    if not conversation or conversation.tenant_id != tenant_id or conversation.actor_id != user.user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversa não encontrada")
+    
+    conversation.is_archived = not conversation.is_archived
+    await session.commit()
+    
+    return {"id": str(conversation.id), "is_archived": conversation.is_archived}

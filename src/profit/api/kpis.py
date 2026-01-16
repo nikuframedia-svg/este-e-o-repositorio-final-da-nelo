@@ -1,0 +1,323 @@
+"""
+ProdPlan ONE - KPIs API
+========================
+
+Endpoint para snapshot de KPIs (source-of-truth para COPILOT).
+"""
+
+import logging
+from datetime import datetime
+from typing import Dict, Any, List, Optional
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, Header, HTTPException, status
+from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func, and_, or_
+
+from src.shared.database import get_session
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/kpis", tags=["KPIs"])
+
+
+def get_tenant_id(x_tenant_id: UUID = Header(...)) -> UUID:
+    """Extract tenant ID from header."""
+    return x_tenant_id
+
+
+class Citation(BaseModel):
+    """Citation para KPI."""
+    source_type: str  # "db", "calculation", "event"
+    ref: str
+    label: str
+    confidence: float = 1.0
+    trust_index: float = 1.0
+
+
+class KPIMetric(BaseModel):
+    """Métrica KPI individual."""
+    value: Optional[float] = None
+    updated_at: Optional[datetime] = None
+    citations: List[Citation] = []
+    reason: Optional[str] = None  # Se value=null, explicar porquê
+
+
+class KPISnapshotResponse(BaseModel):
+    """Resposta do snapshot de KPIs."""
+    oee: KPIMetric
+    availability: KPIMetric
+    performance: KPIMetric
+    quality_fpy: KPIMetric
+    rework_rate: KPIMetric
+    orders_total: KPIMetric
+    orders_in_progress: KPIMetric
+    orders_completed: KPIMetric
+    updated_at: datetime
+
+
+async def calculate_kpis(
+    session: AsyncSession,
+    tenant_id: UUID,
+) -> Dict[str, KPIMetric]:
+    """
+    Calcular KPIs reais da base de dados.
+    
+    Returns:
+        Dict com métricas calculadas ou None se não houver dados.
+    """
+    from sqlalchemy import select, func, and_, or_, case
+    from src.plan.models.schedule import ProductionSchedule, ScheduleStatus
+    from src.copilot.utils.citations import create_db_citation, create_calculation_citation
+    import hashlib
+    
+    kpis = {}
+    
+    try:
+        # 1. Orders stats
+        orders_total_query = select(func.count(func.distinct(ProductionSchedule.order_id))).where(
+            ProductionSchedule.tenant_id == tenant_id
+        )
+        orders_total_result = await session.execute(orders_total_query)
+        orders_total = orders_total_result.scalar() or 0
+        
+        orders_in_progress_query = select(func.count(func.distinct(ProductionSchedule.order_id))).where(
+            and_(
+                ProductionSchedule.tenant_id == tenant_id,
+                ProductionSchedule.status == ScheduleStatus.IN_PROGRESS,
+            )
+        )
+        orders_in_progress_result = await session.execute(orders_in_progress_query)
+        orders_in_progress = orders_in_progress_result.scalar() or 0
+        
+        orders_completed_query = select(func.count(func.distinct(ProductionSchedule.order_id))).where(
+            and_(
+                ProductionSchedule.tenant_id == tenant_id,
+                ProductionSchedule.status == ScheduleStatus.COMPLETED,
+            )
+        )
+        orders_completed_result = await session.execute(orders_completed_query)
+        orders_completed = orders_completed_result.scalar() or 0
+        
+        # Query hash para citations
+        query_hash = hashlib.sha256(f"orders_stats_{tenant_id}".encode()).hexdigest()[:16]
+        
+        kpis["orders_total"] = KPIMetric(
+            value=float(orders_total) if orders_total > 0 else None,
+            updated_at=datetime.utcnow(),
+            citations=[create_db_citation("plan.production_schedules", query_hash, f"Total de ordens: {orders_total}")] if orders_total > 0 else [],
+            reason="NO_SOURCE_DATA" if orders_total == 0 else None,
+        )
+        
+        kpis["orders_in_progress"] = KPIMetric(
+            value=float(orders_in_progress) if orders_in_progress > 0 else None,
+            updated_at=datetime.utcnow(),
+            citations=[create_db_citation("plan.production_schedules", query_hash, f"Ordens em progresso: {orders_in_progress}")] if orders_in_progress > 0 else [],
+            reason="NO_SOURCE_DATA" if orders_in_progress == 0 else None,
+        )
+        
+        kpis["orders_completed"] = KPIMetric(
+            value=float(orders_completed) if orders_completed > 0 else None,
+            updated_at=datetime.utcnow(),
+            citations=[create_db_citation("plan.production_schedules", query_hash, f"Ordens completadas: {orders_completed}")] if orders_completed > 0 else [],
+            reason="NO_SOURCE_DATA" if orders_completed == 0 else None,
+        )
+        
+        # 2. Availability: fases iniciadas / total de fases
+        # Assumindo que status IN_PROGRESS ou COMPLETED = fase iniciada
+        phases_started_query = select(func.count(ProductionSchedule.id)).where(
+            and_(
+                ProductionSchedule.tenant_id == tenant_id,
+                or_(
+                    ProductionSchedule.status == ScheduleStatus.IN_PROGRESS,
+                    ProductionSchedule.status == ScheduleStatus.COMPLETED,
+                ),
+            )
+        )
+        phases_started_result = await session.execute(phases_started_query)
+        phases_started = phases_started_result.scalar() or 0
+        
+        phases_total_query = select(func.count(ProductionSchedule.id)).where(
+            ProductionSchedule.tenant_id == tenant_id
+        )
+        phases_total_result = await session.execute(phases_total_query)
+        phases_total = phases_total_result.scalar() or 0
+        
+        availability = None
+        if phases_total > 0:
+            availability = (phases_started / phases_total) * 100.0
+        
+        availability_query_hash = hashlib.sha256(f"availability_{tenant_id}".encode()).hexdigest()[:16]
+        kpis["availability"] = KPIMetric(
+            value=round(availability, 1) if availability is not None else None,
+            updated_at=datetime.utcnow(),
+            citations=[create_calculation_citation(
+                "availability",
+                {"phases_started": phases_started, "phases_total": phases_total},
+                f"Disponibilidade: {phases_started}/{phases_total} fases iniciadas"
+            )] if availability is not None else [],
+            reason="NO_SOURCE_DATA" if availability is None else None,
+        )
+        
+        # 3. Performance: tempo padrão / tempo real (média)
+        # Assumindo que scheduled_duration_hours é o padrão e actual_end - actual_start é o real
+        performance_query = select(
+            func.avg(ProductionSchedule.scheduled_duration_hours).label("avg_standard"),
+            func.avg(
+                case(
+                    (
+                        and_(
+                            ProductionSchedule.actual_start.isnot(None),
+                            ProductionSchedule.actual_end.isnot(None),
+                        ),
+                        func.extract('epoch', ProductionSchedule.actual_end - ProductionSchedule.actual_start) / 3600.0
+                    ),
+                    else_=None
+                )
+            ).label("avg_actual"),
+        ).where(
+            and_(
+                ProductionSchedule.tenant_id == tenant_id,
+                ProductionSchedule.scheduled_duration_hours.isnot(None),
+                ProductionSchedule.actual_start.isnot(None),
+                ProductionSchedule.actual_end.isnot(None),
+            )
+        )
+        performance_result = await session.execute(performance_query)
+        perf_row = performance_result.first()
+        
+        performance = None
+        if perf_row and perf_row.avg_standard and perf_row.avg_actual and perf_row.avg_actual > 0:
+            performance = min(100.0, (float(perf_row.avg_standard) / float(perf_row.avg_actual)) * 100.0)
+        
+        performance_query_hash = hashlib.sha256(f"performance_{tenant_id}".encode()).hexdigest()[:16]
+        kpis["performance"] = KPIMetric(
+            value=round(performance, 1) if performance is not None else None,
+            updated_at=datetime.utcnow(),
+            citations=[create_calculation_citation(
+                "performance",
+                {"avg_standard": float(perf_row.avg_standard), "avg_actual": float(perf_row.avg_actual)},
+                f"Performance: {perf_row.avg_standard:.2f}h padrão / {perf_row.avg_actual:.2f}h real"
+            )] if performance is not None else [],
+            reason="NO_SOURCE_DATA" if performance is None else None,
+        )
+        
+        # 4. Quality (FPY): orders sem erros / total orders
+        # Por enquanto, assumir que não há modelo de erros, usar orders completadas como proxy
+        # Se houver modelo de erros, ajustar aqui
+        quality_fpy = None
+        if orders_total > 0:
+            # Assumir que orders completadas sem problemas = orders sem erros
+            # Se houver tabela de erros, fazer join aqui
+            orders_without_errors = orders_completed  # Simplificação
+            quality_fpy = (orders_without_errors / orders_total) * 100.0 if orders_total > 0 else None
+        
+        quality_query_hash = hashlib.sha256(f"quality_{tenant_id}".encode()).hexdigest()[:16]
+        kpis["quality_fpy"] = KPIMetric(
+            value=round(quality_fpy, 1) if quality_fpy is not None else None,
+            updated_at=datetime.utcnow(),
+            citations=[create_calculation_citation(
+                "fpy",
+                {"orders_without_errors": orders_without_errors, "orders_total": orders_total},
+                f"FPY: {orders_without_errors}/{orders_total} ordens sem erros"
+            )] if quality_fpy is not None else [],
+            reason="NO_SOURCE_DATA" if quality_fpy is None else None,
+        )
+        
+        # 5. Rework Rate: orders com erros / total orders
+        rework_rate = None
+        if orders_total > 0 and quality_fpy is not None:
+            rework_rate = 100.0 - quality_fpy
+        
+        kpis["rework_rate"] = KPIMetric(
+            value=round(rework_rate, 1) if rework_rate is not None else None,
+            updated_at=datetime.utcnow(),
+            citations=[create_calculation_citation(
+                "rework_rate",
+                {"quality_fpy": quality_fpy},
+                f"Taxa de retrabalho: {rework_rate:.1f}%"
+            )] if rework_rate is not None else [],
+            reason="NO_SOURCE_DATA" if rework_rate is None else None,
+        )
+        
+        # 6. OEE = Availability × Performance × Quality
+        oee = None
+        if availability is not None and performance is not None and quality_fpy is not None:
+            oee = (availability / 100.0) * (performance / 100.0) * (quality_fpy / 100.0) * 100.0
+        
+        kpis["oee"] = KPIMetric(
+            value=round(oee, 1) if oee is not None else None,
+            updated_at=datetime.utcnow(),
+            citations=[create_calculation_citation(
+                "oee",
+                {"availability": availability, "performance": performance, "quality": quality_fpy},
+                f"OEE: {availability:.1f}% × {performance:.1f}% × {quality_fpy:.1f}%"
+            )] if oee is not None else [],
+            reason="NO_SOURCE_DATA" if oee is None else None,
+        )
+        
+    except Exception as e:
+        logger.error(f"Erro ao calcular KPIs: {e}", exc_info=True)
+        # Retornar todos como NO_SOURCE_DATA em caso de erro
+        for kpi_name in ["oee", "availability", "performance", "quality_fpy", "rework_rate", "orders_total", "orders_in_progress", "orders_completed"]:
+            if kpi_name not in kpis:
+                kpis[kpi_name] = KPIMetric(
+                    value=None,
+                    reason=f"ERROR: {str(e)[:50]}",
+                    citations=[],
+                )
+    
+    return kpis
+
+
+@router.get("/snapshot", response_model=KPISnapshotResponse)
+async def get_kpi_snapshot(
+    tenant_id: UUID = Depends(get_tenant_id),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Obter snapshot de KPIs (source-of-truth para COPILOT).
+    
+    Retorna valores reais calculados da base de dados ou null com reason
+    se não houver dados disponíveis.
+    """
+    kpis = await calculate_kpis(session, tenant_id)
+    
+    return KPISnapshotResponse(
+        oee=kpis.get("oee", KPIMetric(value=None, reason="NO_SOURCE_DATA")),
+        availability=kpis.get("availability", KPIMetric(value=None, reason="NO_SOURCE_DATA")),
+        performance=kpis.get("performance", KPIMetric(value=None, reason="NO_SOURCE_DATA")),
+        quality_fpy=kpis.get("quality_fpy", KPIMetric(value=None, reason="NO_SOURCE_DATA")),
+        rework_rate=kpis.get("rework_rate", KPIMetric(value=None, reason="NO_SOURCE_DATA")),
+        orders_total=kpis.get("orders_total", KPIMetric(value=None, reason="NO_SOURCE_DATA")),
+        orders_in_progress=kpis.get("orders_in_progress", KPIMetric(value=None, reason="NO_SOURCE_DATA")),
+        orders_completed=kpis.get("orders_completed", KPIMetric(value=None, reason="NO_SOURCE_DATA")),
+        updated_at=datetime.utcnow(),
+    )
+
+
+@router.get("/snapshot-dev", response_model=KPISnapshotResponse)
+async def get_kpi_snapshot_dev(
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Endpoint de desenvolvimento - SEM autenticação.
+    """
+    from uuid import UUID
+    
+    dev_tenant_id = UUID("00000000-0000-0000-0000-000000000001")
+    kpis = await calculate_kpis(session, dev_tenant_id)
+    
+    return KPISnapshotResponse(
+        oee=kpis.get("oee", KPIMetric(value=None, reason="NO_SOURCE_DATA")),
+        availability=kpis.get("availability", KPIMetric(value=None, reason="NO_SOURCE_DATA")),
+        performance=kpis.get("performance", KPIMetric(value=None, reason="NO_SOURCE_DATA")),
+        quality_fpy=kpis.get("quality_fpy", KPIMetric(value=None, reason="NO_SOURCE_DATA")),
+        rework_rate=kpis.get("rework_rate", KPIMetric(value=None, reason="NO_SOURCE_DATA")),
+        orders_total=kpis.get("orders_total", KPIMetric(value=None, reason="NO_SOURCE_DATA")),
+        orders_in_progress=kpis.get("orders_in_progress", KPIMetric(value=None, reason="NO_SOURCE_DATA")),
+        orders_completed=kpis.get("orders_completed", KPIMetric(value=None, reason="NO_SOURCE_DATA")),
+        updated_at=datetime.utcnow(),
+    )
+

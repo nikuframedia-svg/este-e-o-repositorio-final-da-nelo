@@ -63,6 +63,15 @@ class Settings(BaseSettings):
     # CORS
     cors_origins: str = Field(default="http://localhost:3000,http://localhost:5173")
     
+    # COPILOT
+    copilot_enabled: bool = Field(default=True)
+    ollama_base_url: str = Field(default="http://localhost:11434")
+    ollama_model: str = Field(default="llama3:8b")  # Usar modelo disponível (pode ser override via .env)
+    copilot_embeddings_model: str = Field(default="all-minilm")
+    copilot_rate_limit_per_hour: int = Field(default=60, ge=1)
+    copilot_rate_limit_per_day: int = Field(default=300, ge=1)
+    copilot_trust_index_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    
     @property
     def cors_origins_list(self) -> List[str]:
         """Parse CORS origins into a list."""

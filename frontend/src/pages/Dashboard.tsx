@@ -22,6 +22,7 @@ import {
   FileX,
 } from 'lucide-react';
 import { SimpleTooltip } from '../components/ui';
+import { CopilotInsightsCard } from '../components/copilot/CopilotInsightsCard';
 
 // Import real data
 import ordersData from '../data/orders.json';
@@ -521,6 +522,11 @@ export function Dashboard() {
         {/* OEE Overview - Full Width */}
         <div className="mb-8">
           <OEEOverviewCard />
+        </div>
+        
+        {/* COPILOT INSIGHTS */}
+        <div className="mb-6">
+          <CopilotInsightsCard />
         </div>
         
         {/* KPIs - All values from real data */}

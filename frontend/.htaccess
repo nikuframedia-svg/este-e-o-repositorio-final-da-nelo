@@ -1,0 +1,7 @@
+# Apache configuration (se usar Apache em produção)
+# Remover ou ajustar em desenvolvimento
+
+# Content Security Policy - apenas para produção
+# Header set Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline';"
+
+

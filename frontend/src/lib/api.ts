@@ -17,17 +17,43 @@ async function request<T>(
 ): Promise<T> {
   const url = `${API_BASE}${endpoint}`;
   
+  // Obter token de autenticação do localStorage
+  const token = localStorage.getItem('auth_token') || localStorage.getItem('token');
+  const tenantId = localStorage.getItem('tenant_id') || '00000000-0000-0000-0000-000000000000';
+  
+  const headers: HeadersInit = {
+    'Content-Type': 'application/json',
+    ...options.headers,
+  };
+  
+  // Adicionar token se existir
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+  
+  // Adicionar tenant ID (requerido pelo backend)
+  headers['X-Tenant-Id'] = tenantId;
+  
   const response = await fetch(url, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...options.headers,
-    },
+    headers,
     ...options,
   });
 
   if (!response.ok) {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/b36927af-6ca5-4f4b-8938-4f4afe8aa116',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'api.ts:50',message:'response not ok',data:{status:response.status,statusText:response.statusText,url},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+    // #endregion
+    
     const error = await response.json().catch(() => ({}));
-    throw new Error(error.detail || `HTTP ${response.status}`);
+    const errorMessage = error.detail || error.message || `HTTP ${response.status}`;
+    const errorObj = new Error(errorMessage);
+    (errorObj as any).status = response.status;
+    
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/b36927af-6ca5-4f4b-8938-4f4afe8aa116',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'api.ts:57',message:'throwing error',data:{errorMessage,status:response.status},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+    // #endregion
+    
+    throw errorObj;
   }
 
   return response.json();
@@ -516,6 +542,241 @@ export const healthApi = {
   check: () => request<any>('/health'),
   ready: () => request<any>('/health/ready'),
   live: () => request<any>('/health/live'),
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COPILOT API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Import and re-export types from separate file
+export type { CopilotAskRequest, CopilotResponse, DailyFeedbackResponse } from './copilot-types';
+
+export const copilotApi = {
+  ask: async (data: CopilotAskRequest) => {
+    // Verificar se há token - se não houver, usar diretamente o endpoint dev
+    const token = localStorage.getItem('auth_token') || localStorage.getItem('token');
+    
+    if (!token) {
+      // Sem token, usar diretamente endpoint dev (sem autenticação)
+      // Criar request manual para endpoint dev com tenant_id correto
+      const url = `${API_BASE}/api/copilot/ask-dev`;
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Tenant-Id': '00000000-0000-0000-0000-000000000001', // Tenant dev
+        },
+        body: JSON.stringify(data),
+      });
+      
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        const errorMessage = errorData.detail || errorData.message || `HTTP ${response.status}`;
+        const errorObj = new Error(errorMessage);
+        (errorObj as any).status = response.status;
+        throw errorObj;
+      }
+      
+      return await response.json();
+    }
+    
+    // Com token, tentar endpoint normal primeiro
+    try {
+      return await request<CopilotResponse>('/api/copilot/ask', {
+        method: 'POST',
+        body: JSON.stringify(data),
+      });
+    } catch (error: any) {
+      // Se erro de autenticação, tentar endpoint dev
+      if (error.status === 401 || error.status === 403 || error.message?.includes('Not authenticated') || error.message?.includes('Unauthorized')) {
+        // Criar request manual para endpoint dev com tenant_id correto
+        const url = `${API_BASE}/api/copilot/ask-dev`;
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Tenant-Id': '00000000-0000-0000-0000-000000000001', // Tenant dev
+          },
+          body: JSON.stringify(data),
+        });
+        
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          const errorMessage = errorData.detail || errorData.message || `HTTP ${response.status}`;
+          const errorObj = new Error(errorMessage);
+          (errorObj as any).status = response.status;
+          throw errorObj;
+        }
+        
+        return await response.json();
+      }
+      throw error;
+    }
+  },
+  
+  action: (data: { action_type: string; suggestion_id: string; payload: any }) =>
+    request<any>('/api/copilot/action', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  
+  getDailyFeedback: (date?: string) => {
+    const endpoint = `/api/copilot/daily-feedback${date ? `?date=${date}` : ''}`;
+    const devEndpoint = `/api/copilot/daily-feedback-dev${date ? `?date=${date}` : ''}`;
+    
+    return request<DailyFeedbackResponse>(endpoint).catch((error: any) => {
+      // Se erro de autenticação, tentar endpoint dev (silenciar erro 401)
+      if (error.status === 401 || error.message?.includes('Not authenticated')) {
+        // Não logar erro 401 - é esperado e vamos usar dev endpoint
+        return request<DailyFeedbackResponse>(devEndpoint);
+      }
+      throw error;
+    });
+  },
+  
+  getSuggestion: (id: string) =>
+    request<CopilotResponse>(`/api/copilot/suggestions/${id}`),
+  
+  health: () =>
+    request<any>('/api/copilot/health').catch((error: any) => {
+      // Se erro 401, retornar resposta padrão (health pode funcionar sem auth)
+      if (error.status === 401) {
+        return {
+          status: 'degraded',
+          ollama: 'unknown',
+          embeddings_model: 'unknown',
+        };
+      }
+      throw error;
+    }),
+  
+  getRecommendations: () => {
+    const endpoint = '/api/copilot/recommendations';
+    const devEndpoint = '/api/copilot/recommendations-dev';
+    
+    return request<any[]>(endpoint).catch((error: any) => {
+      if (error.status === 401 || error.message?.includes('Not authenticated')) {
+        return request<any[]>(devEndpoint);
+      }
+      throw error;
+    });
+  },
+  
+  explainRecommendations: (data: { recommendations: any[]; user_query?: string }) => {
+    const endpoint = '/api/copilot/recommendations/explain';
+    const devEndpoint = '/api/copilot/recommendations/explain-dev';
+    
+    return request<CopilotResponse>(endpoint, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }).catch((error: any) => {
+      // Se erro de autenticação, tentar endpoint dev (silenciar erro 401)
+      if (error.status === 401 || error.message?.includes('Not authenticated')) {
+        // Não logar erro 401 - é esperado e vamos usar dev endpoint
+        return request<CopilotResponse>(devEndpoint, {
+          method: 'POST',
+          body: JSON.stringify(data),
+        });
+      }
+      throw error;
+    });
+  },
+  
+  getInsights: (date?: string) => {
+    const endpoint = `/api/copilot/insights${date ? `?date=${date}` : ''}`;
+    const devEndpoint = `/api/copilot/insights-dev${date ? `?date=${date}` : ''}`;
+    
+    return request<any>(endpoint).catch((error: any) => {
+      if (error.status === 401 || error.message?.includes('Not authenticated')) {
+        return request<any>(devEndpoint);
+      }
+      throw error;
+    });
+  },
+  
+  // Conversations API
+  createConversation: (title?: string) => {
+    // Se não houver token, rejeitar imediatamente (sem fazer chamada)
+    const token = typeof window !== 'undefined' ? (localStorage.getItem('auth_token') || localStorage.getItem('token')) : null;
+    if (!token) {
+      const error = new Error('Authentication required');
+      (error as any).status = 401;
+      return Promise.reject(error);
+    }
+    
+    return request<{ id: string; title: string; created_at: string }>('/api/copilot/conversations', {
+      method: 'POST',
+      body: JSON.stringify({ title }),
+    }).catch((error: any) => {
+      // Se erro 401, re-throw para que o componente possa tratar (criar conversa sem BD)
+      throw error;
+    });
+  },
+  
+  listConversations: (params?: { limit?: number; offset?: number; archived?: boolean }) => {
+    // Se não houver token, retornar imediatamente array vazio (sem fazer chamada)
+    const token = typeof window !== 'undefined' ? (localStorage.getItem('auth_token') || localStorage.getItem('token')) : null;
+    if (!token) {
+      return Promise.resolve([]);
+    }
+    
+    const queryParams = new URLSearchParams();
+    if (params?.limit) queryParams.set('limit', String(params.limit));
+    if (params?.offset) queryParams.set('offset', String(params.offset));
+    if (params?.archived !== undefined) queryParams.set('archived', String(params.archived));
+    return request<Array<{
+      id: string;
+      title: string;
+      created_at: string;
+      last_message_at: string | null;
+      is_archived: boolean;
+    }>>(`/api/copilot/conversations?${queryParams.toString()}`).catch((error: any) => {
+      // Se erro 401, retornar array vazio (conversas requerem auth, mas não são críticas)
+      if (error.status === 401 || error.status === 403) {
+        return [];
+      }
+      throw error;
+    });
+  },
+  
+  getConversationMessages: (conversationId: string, params?: { limit?: number; offset?: number }) => {
+    const queryParams = new URLSearchParams();
+    if (params?.limit) queryParams.set('limit', String(params.limit));
+    if (params?.offset) queryParams.set('offset', String(params.offset));
+    return request<Array<{
+      id: string;
+      role: 'user' | 'copilot';
+      content_text: string;
+      content_structured: any | null;
+      created_at: string;
+    }>>(`/api/copilot/conversations/${conversationId}/messages?${queryParams.toString()}`).catch((error: any) => {
+      // Se erro 401, retornar array vazio
+      if (error.status === 401) {
+        return [];
+      }
+      throw error;
+    });
+  },
+  
+  sendMessage: (conversationId: string, data: CopilotAskRequest) =>
+    request<CopilotResponse>(`/api/copilot/conversations/${conversationId}/messages`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }).catch((error: any) => {
+      // Se erro 401, re-throw para que o componente possa usar endpoint normal
+      throw error;
+    }),
+  
+  renameConversation: (conversationId: string, title: string) =>
+    request<{ id: string; title: string }>(`/api/copilot/conversations/${conversationId}/rename`, {
+      method: 'PATCH',
+      body: JSON.stringify({ title }),
+    }),
+  
+  archiveConversation: (conversationId: string) =>
+    request<{ id: string; is_archived: boolean }>(`/api/copilot/conversations/${conversationId}/archive`, {
+      method: 'POST',
+    }),
 };
 
 export const apiInfo = () => request<any>('/');

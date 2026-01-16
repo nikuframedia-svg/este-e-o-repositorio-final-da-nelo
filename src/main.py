@@ -22,6 +22,8 @@ from src.core.api import router as core_router
 from src.plan.api import router as plan_router
 from src.profit.api import router as profit_router
 from src.hr.api import router as hr_router
+from src.copilot.api import router as copilot_router
+from src.legacy.api import router as legacy_router
 
 # Configure logging
 logging.basicConfig(
@@ -38,24 +40,37 @@ async def lifespan(app: FastAPI):
     logger.info("Starting ProdPlan ONE...")
     
     try:
-        # Initialize database
-        await init_db()
-        logger.info("Database initialized")
+        # Initialize database (opcional - permite iniciar sem DB para testes)
+        try:
+            await init_db()
+            logger.info("Database initialized")
+        except Exception as db_error:
+            logger.warning(f"Database connection failed: {db_error}")
+            logger.warning("Backend iniciado SEM base de dados. Algumas funcionalidades estarão limitadas.")
+            logger.warning("Para usar o COPILOT completo, inicia o PostgreSQL.")
         
-        # Initialize Redis
-        redis = await get_redis()
-        logger.info("Redis connected")
+        # Initialize Redis (opcional)
+        try:
+            redis = await get_redis()
+            logger.info("Redis connected")
+        except Exception as redis_error:
+            logger.warning(f"Redis connection failed: {redis_error}")
+            logger.warning("Backend iniciado SEM Redis. Rate limiting usará fallback em memória.")
         
-        # Initialize Kafka producer
+        # Initialize Kafka producer (opcional)
         if not settings.is_development:
-            producer = await get_producer()
-            logger.info("Kafka producer started")
+            try:
+                producer = await get_producer()
+                logger.info("Kafka producer started")
+            except Exception as kafka_error:
+                logger.warning(f"Kafka connection failed: {kafka_error}")
         
         logger.info("ProdPlan ONE started successfully")
         
     except Exception as e:
         logger.error(f"Startup failed: {e}")
-        raise
+        # Não fazer raise - permite iniciar mesmo com erros parciais
+        logger.warning("Continuando com funcionalidades limitadas...")
     
     yield
     
@@ -92,13 +107,19 @@ app.add_middleware(
 async def global_exception_handler(request: Request, exc: Exception):
     """Global exception handler."""
     logger.exception(f"Unhandled exception: {exc}")
-    return JSONResponse(
+    response = JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
             "error": "Internal server error",
             "detail": str(exc) if settings.debug else None,
         },
     )
+    # Garantir que CORS headers são enviados mesmo em caso de erro
+    origin = request.headers.get("origin")
+    if origin and origin in settings.cors_origins_list:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    return response
 
 
 # Health check endpoints
@@ -145,6 +166,8 @@ app.include_router(core_router)
 app.include_router(plan_router)
 app.include_router(profit_router)
 app.include_router(hr_router)
+app.include_router(copilot_router)
+app.include_router(legacy_router)  # Legacy endpoints for compatibility
 
 
 # API info
@@ -154,7 +177,7 @@ async def root():
     return {
         "name": "ProdPlan ONE",
         "version": "1.0.0",
-        "modules": ["CORE", "PLAN", "PROFIT", "HR"],
+        "modules": ["CORE", "PLAN", "PROFIT", "HR", "COPILOT"],
         "docs_url": "/docs",
         "openapi_url": "/openapi.json",
     }
